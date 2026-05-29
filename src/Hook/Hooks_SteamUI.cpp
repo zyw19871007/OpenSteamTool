@@ -43,9 +43,9 @@ namespace Hooks_SteamUI {
     }
 
     void RemoveAppAndSendChange(AppId_t appId) {
-        // Only attempt to remove if LuaConfig is tracking this appId
-        if(!LuaConfig::HasDepot(appId)){
-            LOG_STEAMUI_WARN("RemoveAppAndSendChange: appId={} not tracked in LuaConfig, skipping", appId);
+        // skip on owned apps
+        if(LuaConfig::IsOwned(appId)){
+            LOG_STEAMUI_WARN("RemoveAppAndSendChange: appId={} is owned, skipping", appId);
             return;
         }
         if(CAPTURE_READY(GetAppByID) && CAPTURE_READY(MarkAppChange)) {
