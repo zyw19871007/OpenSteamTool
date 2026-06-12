@@ -8,27 +8,27 @@ env:
 
 on:
   schedule:
-    - cron: "0 * * * *"  # 每小时整点自动执行，对应北京时间每小时整点
-  workflow_dispatch:      # 保留手动触发按钮，首次全量同步使用
+    - cron: "0 * * * *"
+  workflow_dispatch:
 
 jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
       - name: 安装依赖工具
-        run: sudo apt-get update && sudo apt-get install -y jq wget
+        run: sudo apt-get update && sudo apt-get install -y jq wget curl
 
       - name: 执行Release同步
         env:
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
         run: |
-          # ========== 前置检查：最新版本一致则直接退出，节省API请求 ==========
+          # ========== 前置检查 ==========
           echo "==> 检查上游最新版本"
-          latest_github_resp=$(curl -s "https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest")
+          latest_github_resp=$(curl -s --connect-timeout 10 --max-time 30 "https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest")
           latest_github_tag=$(echo "$latest_github_resp" | jq -r '.tag_name')
           
           echo "==> 检查Gitee最新版本"
-          latest_gitee_resp=$(curl -s "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases/latest?access_token=${GITEE_TOKEN}")
+          latest_gitee_resp=$(curl -s --connect-timeout 10 --max-time 30 "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases/latest?access_token=${GITEE_TOKEN}")
           latest_gitee_tag=$(echo "$latest_gitee_resp" | jq -r '.tag_name')
 
           if [ "$latest_github_tag" = "$latest_gitee_tag" ] && [ -n "$latest_github_tag" ] && [ "$latest_github_tag" != "null" ]; then
@@ -38,32 +38,29 @@ jobs:
           echo "🔍 检测到版本差异，开始全量同步检查..."
           # =================================================================
 
-          # 1. 获取GitHub全部Release列表（最多100个）
+          # 1. 获取全部Release列表
           echo "==> 获取上游仓库全部Release列表"
-          github_releases=$(curl -s "https://api.github.com/repos/${UPSTREAM_REPO}/releases?per_page=100")
+          github_releases=$(curl -s --connect-timeout 10 --max-time 30 "https://api.github.com/repos/${UPSTREAM_REPO}/releases?per_page=100")
           
-          # 2. 获取Gitee已有Release的tag列表，用于去重
+          # 2. 获取Gitee已有版本
           echo "==> 获取Gitee已有版本清单"
-          gitee_tags=$(curl -s "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases?access_token=${GITEE_TOKEN}&per_page=100" | jq -r '.[].tag_name')
+          gitee_tags=$(curl -s --connect-timeout 10 --max-time 30 "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases?access_token=${GITEE_TOKEN}&per_page=100" | jq -r '.[].tag_name')
           
-          # 3. 遍历每个GitHub Release，逐个判断是否需要同步
+          # 3. 遍历同步
           echo "$github_releases" | jq -c '.[]' | while read -r release; do
             tag=$(echo "$release" | jq -r '.tag_name')
             is_prerelease=$(echo "$release" | jq -r '.prerelease')
             target_commitish=$(echo "$release" | jq -r '.target_commitish')
             
-            # 兜底：如果target_commitish为空，默认用master
             if [ "$target_commitish" = "null" ] || [ -z "$target_commitish" ]; then
               target_commitish="master"
             fi
             
-            # 根据配置跳过预发布版本
             if [ "$SYNC_PRERELEASE" = "false" ] && [ "$is_prerelease" = "true" ]; then
               echo "⏭️  跳过预发布版本: $tag"
               continue
             fi
             
-            # 检查Gitee是否已存在该版本，存在则跳过
             if echo "$gitee_tags" | grep -qx "$tag"; then
               echo "✅ 版本 $tag 已存在，跳过"
               continue
@@ -76,9 +73,10 @@ jobs:
             release_name=$(echo "$release" | jq -r '.name')
             release_body=$(echo "$release" | jq -r '.body')
             
-            # 4. 在Gitee创建对应Release（补充target_commitish必填字段）
+            # 4. 创建Gitee Release
             echo "   → 在Gitee创建Release条目"
             create_result=$(curl -s -X POST \
+              --connect-timeout 10 --max-time 30 \
               -H "Content-Type: application/json" \
               -d "$(jq -n \
                 --arg tag "$tag" \
@@ -96,16 +94,36 @@ jobs:
             fi
             echo "   ✅ Release创建成功，ID: $release_id"
             
-            # 5. 下载所有附件并上传到Gitee
+            # 5. 下载并上传附件（核心修复区）
             echo "$release" | jq -c '.assets[]' | while read -r asset; do
               asset_name=$(echo "$asset" | jq -r '.name')
               download_url=$(echo "$asset" | jq -r '.browser_download_url')
+              asset_size=$(echo "$asset" | jq -r '.size')
               
-              echo "   → 下载附件: $asset_name"
-              wget -q -c -O "$asset_name" "$download_url"
+              echo "   → 下载附件: $asset_name (约 $((asset_size/1024/1024)) MB)"
               
-              echo "   → 上传附件到Gitee"
+              # 下载：超时300秒，重试2次，失败则跳过
+              wget -c --timeout=30 --tries=2 -O "$asset_name" "$download_url"
+              if [ ! -f "$asset_name" ]; then
+                echo "   ❌ 附件下载失败，跳过: $asset_name"
+                continue
+              fi
+              
+              # 校验文件大小
+              local_size=$(stat -c%s "$asset_name")
+              if [ "$local_size" -ne "$asset_size" ]; then
+                echo "   ⚠️  文件大小不匹配，可能下载不完整，尝试继续上传"
+              fi
+              
+              echo "   → 上传附件到Gitee..."
+              # 上传核心修复：禁用Expect头 + 超时控制 + 失败重试
+              # 禁用Expect:100-continue是解决国内接口上传卡住的关键
               upload_result=$(curl -s -X POST \
+                --connect-timeout 30 \
+                --max-time 600 \
+                --retry 2 \
+                --retry-delay 5 \
+                -H "Expect:" \
                 -F "file=@$asset_name" \
                 "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases/${release_id}/attachments?access_token=${GITEE_TOKEN}")
               
