@@ -50,6 +50,12 @@ jobs:
           echo "$github_releases" | jq -c '.[]' | while read -r release; do
             tag=$(echo "$release" | jq -r '.tag_name')
             is_prerelease=$(echo "$release" | jq -r '.prerelease')
+            target_commitish=$(echo "$release" | jq -r '.target_commitish')
+            
+            # 兜底：如果target_commitish为空，默认用master
+            if [ "$target_commitish" = "null" ] || [ -z "$target_commitish" ]; then
+              target_commitish="master"
+            fi
             
             # 根据配置跳过预发布版本
             if [ "$SYNC_PRERELEASE" = "false" ] && [ "$is_prerelease" = "true" ]; then
@@ -70,7 +76,7 @@ jobs:
             release_name=$(echo "$release" | jq -r '.name')
             release_body=$(echo "$release" | jq -r '.body')
             
-            # 4. 在Gitee创建对应Release
+            # 4. 在Gitee创建对应Release（补充target_commitish必填字段）
             echo "   → 在Gitee创建Release条目"
             create_result=$(curl -s -X POST \
               -H "Content-Type: application/json" \
@@ -78,8 +84,9 @@ jobs:
                 --arg tag "$tag" \
                 --arg name "$release_name" \
                 --arg body "$release_body" \
+                --arg commitish "$target_commitish" \
                 --argjson prerelease "$is_prerelease" \
-                '{tag_name: $tag, name: $name, body: $body, prerelease: $prerelease}')" \
+                '{tag_name: $tag, name: $name, body: $body, target_commitish: $commitish, prerelease: $prerelease}')" \
               "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases?access_token=${GITEE_TOKEN}")
             
             release_id=$(echo "$create_result" | jq -r '.id')
