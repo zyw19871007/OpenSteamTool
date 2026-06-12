@@ -1,0 +1,118 @@
+name: 同步 GitHub Release 到 Gitee
+
+env:
+  UPSTREAM_REPO: "OpenSteam001/OpenSteamTool"
+  GITEE_OWNER: "zyw19871007"
+  GITEE_REPO: "OpenSteamTool"
+  SYNC_PRERELEASE: false
+
+on:
+  schedule:
+    - cron: "0 * * * *"  # 每小时整点自动执行，对应北京时间每小时整点
+  workflow_dispatch:      # 保留手动触发按钮，首次全量同步使用
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 安装依赖工具
+        run: sudo apt-get update && sudo apt-get install -y jq wget
+
+      - name: 执行Release同步
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+        run: |
+          # ========== 前置检查：最新版本一致则直接退出，节省API请求 ==========
+          echo "==> 检查上游最新版本"
+          latest_github_resp=$(curl -s "https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest")
+          latest_github_tag=$(echo "$latest_github_resp" | jq -r '.tag_name')
+          
+          echo "==> 检查Gitee最新版本"
+          latest_gitee_resp=$(curl -s "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases/latest?access_token=${GITEE_TOKEN}")
+          latest_gitee_tag=$(echo "$latest_gitee_resp" | jq -r '.tag_name')
+
+          if [ "$latest_github_tag" = "$latest_gitee_tag" ] && [ -n "$latest_github_tag" ] && [ "$latest_github_tag" != "null" ]; then
+            echo "✅ 最新版本 $latest_github_tag 已同步，无新版本，任务结束"
+            exit 0
+          fi
+          echo "🔍 检测到版本差异，开始全量同步检查..."
+          # =================================================================
+
+          # 1. 获取GitHub全部Release列表（最多100个）
+          echo "==> 获取上游仓库全部Release列表"
+          github_releases=$(curl -s "https://api.github.com/repos/${UPSTREAM_REPO}/releases?per_page=100")
+          
+          # 2. 获取Gitee已有Release的tag列表，用于去重
+          echo "==> 获取Gitee已有版本清单"
+          gitee_tags=$(curl -s "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases?access_token=${GITEE_TOKEN}&per_page=100" | jq -r '.[].tag_name')
+          
+          # 3. 遍历每个GitHub Release，逐个判断是否需要同步
+          echo "$github_releases" | jq -c '.[]' | while read -r release; do
+            tag=$(echo "$release" | jq -r '.tag_name')
+            is_prerelease=$(echo "$release" | jq -r '.prerelease')
+            
+            # 根据配置跳过预发布版本
+            if [ "$SYNC_PRERELEASE" = "false" ] && [ "$is_prerelease" = "true" ]; then
+              echo "⏭️  跳过预发布版本: $tag"
+              continue
+            fi
+            
+            # 检查Gitee是否已存在该版本，存在则跳过
+            if echo "$gitee_tags" | grep -qx "$tag"; then
+              echo "✅ 版本 $tag 已存在，跳过"
+              continue
+            fi
+            
+            echo "======================================"
+            echo "🚀 开始同步版本: $tag"
+            echo "======================================"
+            
+            release_name=$(echo "$release" | jq -r '.name')
+            release_body=$(echo "$release" | jq -r '.body')
+            
+            # 4. 在Gitee创建对应Release
+            echo "   → 在Gitee创建Release条目"
+            create_result=$(curl -s -X POST \
+              -H "Content-Type: application/json" \
+              -d "$(jq -n \
+                --arg tag "$tag" \
+                --arg name "$release_name" \
+                --arg body "$release_body" \
+                --argjson prerelease "$is_prerelease" \
+                '{tag_name: $tag, name: $name, body: $body, prerelease: $prerelease}')" \
+              "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases?access_token=${GITEE_TOKEN}")
+            
+            release_id=$(echo "$create_result" | jq -r '.id')
+            if [ "$release_id" = "null" ]; then
+              echo "   ❌ 创建Release失败: $create_result"
+              continue
+            fi
+            echo "   ✅ Release创建成功，ID: $release_id"
+            
+            # 5. 下载所有附件并上传到Gitee
+            echo "$release" | jq -c '.assets[]' | while read -r asset; do
+              asset_name=$(echo "$asset" | jq -r '.name')
+              download_url=$(echo "$asset" | jq -r '.browser_download_url')
+              
+              echo "   → 下载附件: $asset_name"
+              wget -q -c -O "$asset_name" "$download_url"
+              
+              echo "   → 上传附件到Gitee"
+              upload_result=$(curl -s -X POST \
+                -F "file=@$asset_name" \
+                "https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}/releases/${release_id}/attachments?access_token=${GITEE_TOKEN}")
+              
+              if echo "$upload_result" | jq -e '.id' > /dev/null; then
+                echo "   ✅ 附件 $asset_name 上传成功"
+              else
+                echo "   ❌ 附件 $asset_name 上传失败: $upload_result"
+              fi
+              
+              rm -f "$asset_name"
+            done
+            
+            echo "🎉 版本 $tag 同步完成"
+            echo ""
+          done
+          
+          echo "🏁 全部同步任务执行完毕"
